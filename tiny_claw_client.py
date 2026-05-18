@@ -2352,8 +2352,6 @@ code_theme=self.markdown_theme
                         if self.active_skill: # 有激活的skill情况下，渐进式加载skill内容
                             self.messages[0] = {"role": "system", "content": self.gen_agent_system_content(mcp_when_to_use)}
                         
-
-                        print(11111111111111111,self.messages)
                         # 每轮重新初始化
                         if self.llm_client.support_stream:
                             orig_llm_response,tool_calls,reasoning_content =  await self.showAndGetAssistantResponseStream(self.llm_client,self.messages,use_tool_call=True)
