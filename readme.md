@@ -6,6 +6,10 @@
  - 在`skills/`文件夹下，可以添加各种技能
  - 在`workspace/`文件夹是各种工作目录，下面可以添加一个`memory.md`, 写入用户的工具调用习惯
 
+## 安装
+python >= 3.13
+`pip install -r requirements.txt`
+
 
 ## 类图
 
