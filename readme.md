@@ -232,9 +232,11 @@ sequenceDiagram
 
 ## 客户端快照
 1、基本命令  
-<img width="751" height="1022" alt="image" src="https://github.com/user-attachments/assets/617644c4-1498-44d7-ab7c-6c209ddea1de" />  
+<img width="761" height="983" alt="image" src="https://github.com/user-attachments/assets/e8df57dd-ff44-4800-bb60-6eed70bb8bb9" />
+
 
 2、工具调用  
-<img width="755" height="670" alt="image" src="https://github.com/user-attachments/assets/f5fbeff3-da94-4dd1-94d2-fb066ddac076" />
+<img width="755" height="670" alt="image" src="https://github.com/user-attachments/assets/92bfaf61-af43-41cd-a760-5049a6b4e4b5" />
+
 
 
