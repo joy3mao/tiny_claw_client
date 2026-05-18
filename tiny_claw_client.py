@@ -636,6 +636,7 @@ class LLMClient:
 
 
 
+
 # ====================== Configuration ======================
 
 class Configuration:
@@ -927,7 +928,7 @@ class ChatSession:
     def __init__(self) -> None:
         self.servers: list[Server] = []
         self.invalid_servers: set[Server] = set() # 将连接失败地服务器加入不可用中
-        self.llm_client: LLMClient | None  = None
+        self.llm_client: LLMClient  | None  = None
         self.usage :dict = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         self.markdown_theme : str = code_themes[0]
         self.log_file = None
@@ -1693,7 +1694,6 @@ code_theme=self.markdown_theme
                                         support_thinking=model_info["support_thinking"],
                                         support_multimodal=model_info.get("support_multimodal",False),
                                         http_proxy=model_info["api_proxy"])
-     
         else:
             error_console.print(f"❌ Unsupport AI API STYLE: {model_info["api_style"]}")
       
@@ -1878,7 +1878,7 @@ code_theme=self.markdown_theme
         tools_desc = "---  \n".join([tool.format_for_llm() for tool in (await server.list_tools())])
         # 给MCP Tool插入上下文
         tool_call_history_List = []
-        for msg in self.messages[-10:]: # 只取最后10条消息
+        for msg in self.messages[-8:]: # 只取最后8条消息
             msg_content = msg["content"].strip()
             if msg["role"] == "user":
                 if msg_content.startswith("<tool_results>") and msg_content.endswith("</tool_results>"):
@@ -2352,6 +2352,8 @@ code_theme=self.markdown_theme
                         if self.active_skill: # 有激活的skill情况下，渐进式加载skill内容
                             self.messages[0] = {"role": "system", "content": self.gen_agent_system_content(mcp_when_to_use)}
                         
+
+                        print(11111111111111111,self.messages)
                         # 每轮重新初始化
                         if self.llm_client.support_stream:
                             orig_llm_response,tool_calls,reasoning_content =  await self.showAndGetAssistantResponseStream(self.llm_client,self.messages,use_tool_call=True)
@@ -2383,10 +2385,15 @@ code_theme=self.markdown_theme
                         # 针对支持function_call/不支持function_call的模型，分别处理
                         if self.llm_client.support_tool_call and functions:
                             tool_execute_list = functions
-                            self.messages.append({"role": "assistant", "content": orig_llm_response, "function_call": tool_calls, "reasoning": reasoning_content if reasoning_content else "正在调用工具..."})
+                            reasoning_content = (reasoning_content or "正在调用工具...")
+                            self.messages.append({"role": "assistant", "content": orig_llm_response, "tool_calls": tool_calls, "reasoning_content": reasoning_content })
+                            # 写入日志 
+                            self.appendInfo2Log("assistant",(f"**content**:{orig_llm_response}  \n**tool_calls**:{tool_calls}  \n**reasoning_content**:{reasoning_content}"))
                         else:
                             tool_execute_list = extract_tool_calls(orig_llm_response)
                             self.messages.append({"role": "assistant", "content": orig_llm_response})
+                             # 写入日志 
+                            self.appendInfo2Log("assistant",orig_llm_response)
 
                         # 无工具调用，结束处理
                         if not tool_execute_list: 
@@ -2422,26 +2429,22 @@ code_theme=self.markdown_theme
                             tool_results.append({"tool_call_id": func_id,"tool_name":func_name,"content":result})
 
                         # 不是所有模型兼容如下格式
-                        # # 将工具结果作为一条 user 消息追加，供模型继续处理
-                        # if self.llm_client.support_tool_call and self.messages[-1]["role"]=="assistant" and tool_calls:
-                        #     self.messages[-1]["tool_calls"] = tool_calls
-                        #     # 写入日志 
-                        #     self.appendInfo2Log("assistant",(f"**content**:{self.messages[-1]["content"]}  \n"
-                        #                                      f"**tool_calls**:{self.messages[-1]["tool_calls"]}  \n"
-                        #                                      f"**reasoning_content**:{self.messages[-1]["reasoning_content"]}"))
-                        #     # 填充tool—result信息
-                        #     for tool_rst in tool_results:
-                        #         if not tool_rst["tool_call_id"]:
-                        #             continue
-                        #         self.messages.append({"role": "tool","tool_call_id": tool_rst["tool_call_id"], "content": tool_rst["content"]})
-                        # else:
+                        # 将工具结果作为一条 user 消息追加，供模型继续处理
+                        if self.llm_client.support_tool_call and self.messages[-1]["role"]=="assistant" and self.messages[-1]["tool_calls"]:
+                            # 填充tool—result信息
+                            for tool_rst in tool_results:
+                                if not tool_rst["tool_call_id"]:
+                                    continue
+                                self.messages.append({"role": "tool","tool_call_id": tool_rst["tool_call_id"], "content": tool_rst["content"]})
+                                # 写入日志
+                                self.appendInfo2Log("tool",f"**tool_call_id**:{tool_rst['tool_call_id']}; **content**:{tool_rst['content']}")  
+                        else:
 
-                        combined_result = "  \n".join([f"工具**{tr['tool_name']}**(id:{tr['tool_call_id']})的执行结果为：\n{tr['content']}" for tr in tool_results])
-                        user_content =f"<tool_results>\n{combined_result}\n</tool_results>"
-                        self.messages.append({"role": "user", "content": user_content}) 
-                        # 写入日志
-                        self.appendInfo2Log("assistant",orig_llm_response)
-                        self.appendInfo2Log("user",user_content)    
+                            combined_result = "  \n".join([f"工具**{tr['tool_name']}**(id:{tr['tool_call_id']})的执行结果为：\n{tr['content']}" for tr in tool_results])
+                            user_content =f"<tool_results>\n{combined_result}\n</tool_results>"
+                            self.messages.append({"role": "user", "content": user_content}) 
+                            # 写入日志
+                            self.appendInfo2Log("user",user_content)    
         
                 except KeyboardInterrupt:
                     server_console.print("💻 Exiting...")
