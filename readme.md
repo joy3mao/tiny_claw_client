@@ -1,4 +1,4 @@
-<img width="761" height="983" alt="image" src="https://github.com/user-attachments/assets/c8b72eab-8ddf-4b08-be07-69b0a5018e30" />## 大体介绍
+## 大体介绍
 这个是小型的龙虾客户端，主要兼容openai的api的模型，部分代码为AI生成。
  - 在`configs.json`中配置了api_key和api_url，及mcp服务的地址。
  - mcp服务配置项中有特殊项`when_to_use`，因为本客户端针对MCP也做了“渐进式披露”处理，需要你维护好，便于大模型准确选择使用
