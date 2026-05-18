@@ -234,7 +234,7 @@ sequenceDiagram
 1、基本命令  
 <img width="751" height="1022" alt="image" src="https://github.com/user-attachments/assets/617644c4-1498-44d7-ab7c-6c209ddea1de" />  
 
-2、工具调用
+2、工具调用  
 <img width="755" height="670" alt="image" src="https://github.com/user-attachments/assets/f5fbeff3-da94-4dd1-94d2-fb066ddac076" />
 
 
