@@ -1015,7 +1015,7 @@ class ChatSession:
                 return "[ERROR]PowerShell 命令包含潜在危险操作，已被拒绝。" 
         try:
             # Windows 下使用 shell=True 会调用 cmd.exe
-            if is_powershell or is_nodejs:
+            if is_nodejs:
                 command = f'powershell -Command "{command}"'
             result = subprocess.run(
                 command,
@@ -1023,7 +1023,7 @@ class ChatSession:
                 capture_output=True,
                 text=True,
                 timeout=20,
-                encoding='utf-8',
+                encoding='gbk',
                 errors='replace',
                 cwd=WORKSPACE_DIR,
                 env=os.environ.copy()  # 继承系统环境变量
