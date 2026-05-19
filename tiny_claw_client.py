@@ -617,7 +617,7 @@ class LLMClient:
                                     tool = data['choices'][0]["delta"]["tool_calls"][0]
                                     if tool.get("type") == "function" and tool.get("id","").strip():
                                         yield 31,json.dumps(tool)   # 提取工具(带ID才算)
-                                    elif tool["function"].get("arguments","").strip():
+                                    elif tool["function"].get("arguments",""): # 不能trim
                                         yield 32,tool["function"]["arguments"] # 提取工具参数流式片段
                                     else:
                                         continue
