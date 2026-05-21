@@ -32,13 +32,41 @@ from functools import partial
 from dataclasses import dataclass
 import subprocess,platform
 import base64
+from PIL import Image
+from io import BytesIO
 
 
-def image_to_base64(image_path):
+def image_to_base64(image_path,max_size_kb):
     """将图片文件转换为base64编码的字符串"""
-    with open(image_path, 'rb') as image_file:
-        encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
-    return f"data:image/png;base64,{encoded_string}"
+
+    img_size_kb = os.path.getsize(image_path) / 1024
+    if img_size_kb<=max_size_kb:
+        with open(image_path, 'rb') as image_file:
+            encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+        return f"data:image/png;base64,{encoded_string}"
+    else:
+        img = Image.open(image_path)
+        fmt = img.format
+        if fmt == 'JPEG' or fmt == 'JPG':
+            if img.mode in ('RGBA', 'LA', 'P'):
+                img = img.convert('RGB')
+        elif fmt == 'PNG':
+            if img.mode == 'P':
+                img = img.convert('RGBA')
+        # 压缩 - 尝试调整质量和尺寸
+        buf = BytesIO()
+        save_fmt = 'JPEG' if fmt in ('JPEG', 'JPG') else 'PNG'
+        img.save(buf, format=save_fmt, quality=int(img_size_kb/max_size_kb*100), optimize=True)
+        size = buf.tell()
+        while size > max_size_kb * 1024:
+            w, h = img.size
+            img = img.resize((int(w*0.8), int(h*0.8)), Image.LANCZOS)
+            buf = BytesIO()
+            img.save(buf, format=save_fmt, quality=80, optimize=True)
+            size = buf.tell()
+        encoded_string = base64.b64encode(buf.getvalue()).decode()
+        return f"data:image/png;base64,{encoded_string}"
+
 
 # ====================== 基础设置 ======================
 base_tools = [
@@ -86,13 +114,17 @@ base_tools = [
         "type": "function",
         "function":{
             "name": "execute_bash",
-            "description": "执行bash/cmd命令",
+            "description": "执行bash/cmd/powershell命令",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "完整的bash/cmd命令",
+                        "description": "完整的bash/cmd/powershell命令",
+                    },
+                    "command_type": {
+                        "type": "string",
+                        "description": "bash/cmd/powershell",
                     }
                 },
                 "required": ["command"]
@@ -344,7 +376,7 @@ def load_skills_metadata() -> List[Dict[str, str]]:
                 "description": frontmatter.get("description", "")
             })
         except Exception as e:
-            error_console.print(f"⚠️ Failed to load skill {skill_name}: {e}")
+            error_console.print(f" ⚠️ 加载此Skill失败 - {skill_name}: {e}")
     return skills_meta
 
 def load_skill_full(skill_name: str) -> Optional[Skill]:
@@ -360,7 +392,7 @@ def load_skill_full(skill_name: str) -> Optional[Skill]:
             path=skill_path
         )
     except Exception as e:
-        error_console.print(f"⚠️ Error loading full skill {skill_name}: {e}")
+        error_console.print(f" ⚠️ 加载此Skill失败 - {skill_name}: {e}")
         return None
     
 def extract_tool_calls(text: str) -> List[Dict]:
@@ -368,7 +400,7 @@ def extract_tool_calls(text: str) -> List[Dict]:
     从模型输出中提取约定格式的工具调用。
     格式示例：
         <tool_call>skill_call {"skill_name": "pdf_processor", "user_request": "提取PDF文本"}</tool_call>
-        <tool_call>execute_bash {"command": "tasklist | findstr python"}</tool_call>
+        <tool_call>execute_bash {"command": "tasklist | findstr python","command_type": "cmd"}</tool_call>
     返回列表，每个元素为 {"name": func_name, "arguments": dict}
     """
     pattern = r"<tool_call>(\w+)\s+({.*?})\s*</tool_call>"
@@ -379,7 +411,7 @@ def extract_tool_calls(text: str) -> List[Dict]:
             args = json.loads(args_str, strict=False)
             tool_calls.append({"name": func_name, "arguments": args})
         except json.JSONDecodeError:
-            error_console.print(f"⚠️ 无法解析工具参数 JSON: {args_str}")
+            error_console.print(f" ⚠️ 无法解析工具参数 JSON: {args_str}")
     return tool_calls
 
 def extract_mcp_tools(text: str) -> List|None:
@@ -540,7 +572,7 @@ class LLMClient:
 
         try:
             async with httpx.AsyncClient(proxy=self.http_proxy) as client:
-                response = await client.post( self.ai_api_url, headers=headers, json=payload,timeout=120)
+                response = await client.post( self.ai_api_url, headers=headers, json=payload,timeout=360)
                 response.raise_for_status()
                 data = response.json()
                 usage = None
@@ -617,7 +649,7 @@ class LLMClient:
                                     tool = data['choices'][0]["delta"]["tool_calls"][0]
                                     if tool.get("type") == "function" and tool.get("id","").strip():
                                         yield 31,json.dumps(tool)   # 提取工具(带ID才算)
-                                    elif tool["function"].get("arguments",""): # 不能trim
+                                    elif tool["function"].get("arguments",""): # 提取工具参数(不能trim！)
                                         yield 32,tool["function"]["arguments"] # 提取工具参数流式片段
                                     else:
                                         continue
@@ -627,15 +659,11 @@ class LLMClient:
                                 continue # 丢包了
                     except Exception as e:
                         yield 0,f" {str(e)}"
-            except (httpx.RequestError,StopAsyncIteration) as e:
+            except (httpx.HTTPError,StopAsyncIteration) as e:
                 error_message = f"{str(e)}"
                 if isinstance(e, httpx.HTTPStatusError):
-                    error_message = f" {e.response.status_code} | {e.response.text}"
+                    error_message = f"Response code:{e.response.status_code}, content: {repr(e.response.text)}"
                 yield 0,error_message
-
-
-
-
 
 # ====================== Configuration ======================
 
@@ -824,7 +852,7 @@ class Server:
 
             return tools
         except:
-            error_console.print(f"❌ Error getting tools from server {self.name}.")
+            error_console.print(f" ❌ 从此MCP服务获取工具列表失败: {self.name}")
             await self.cleanup()
             return None
 
@@ -836,7 +864,7 @@ class Server:
                 self.session = None
                 self.stdio_context = None
         except Exception as e:
-            error_console.print(f"❌ Error during cleanup of server {self.name}: {e}")
+            error_console.print(f"❌ 清理此MCP服务时遇到异常 - {self.name}: {e}")
 
     async def execute_tool(
         self,
@@ -896,7 +924,7 @@ class Server:
                     )
             return prompts
         except Exception as e:
-            server_console.print(f"[ERROR] Can't getting prompts from server {escape(self.name)}: {escape(str(e))}")
+            server_console.print(f" [ERROR] 无法从此MCP服务获取Prmpts - {escape(self.name)}: {escape(str(e))}")
             return []
 
     async def get_prompt(self, prompt_name: str, arguments: dict[str, Any]) -> GetPromptResult | None:
@@ -928,7 +956,7 @@ class ChatSession:
     def __init__(self) -> None:
         self.servers: list[Server] = []
         self.invalid_servers: set[Server] = set() # 将连接失败地服务器加入不可用中
-        self.llm_client: LLMClient  | None  = None
+        self.llm_client: LLMClient | None  = None
         self.usage :dict = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         self.markdown_theme : str = code_themes[0]
         self.log_file = None
@@ -939,7 +967,7 @@ class ChatSession:
         self.tool_handlers = {
             "skill_call": self.handle_skill_call,
             "mcp_call": self.handle_mcp_call,
-            "execute_bash": lambda **kwargs: self.execute_bash(kwargs["command"]),
+            "execute_bash": lambda **kwargs: self.execute_bash(kwargs["command"],kwargs.get("command_type","cmd")),
             "execute_script": lambda **kwargs: self.execute_script(kwargs["script_name"],kwargs.get("args", []),kwargs.get("timeout", 30)),
             "read_file": lambda **kwargs: self.read_file(kwargs["path"]),
             "read_file_with_lineno": lambda **kwargs: self.read_file_with_lineno(kwargs["path"]),
@@ -953,7 +981,7 @@ class ChatSession:
         try:
             self.base_configs = config.load_config("configs.json") # 重新读取配置
         except Exception as e:
-            error_console.print(f"❌ Failed to load config.json: {e}")
+            error_console.print(f" ❌ 无法加载config.json: {e}")
             self.base_configs = {"llm_models": [], "mcp_servers": [],"search_switch": {}}
 
         # 开启web搜索时，添加web_search工具
@@ -970,10 +998,10 @@ class ChatSession:
             model_no+=1
         
         if not self.client_models:
-            error_console.print("❌ No LLM models available. Please add LLM models in configs.json.")
+            error_console.print(" ❌ 无有效的AI大模型，亲在configs.json中配置AI大模型。")
 
     # ====================== BASE TOOL ======================
-    def execute_bash(self,command: str) -> str:
+    def execute_bash(self,command: str, command_type: str = "cmd") -> str:
         """
         在 Windows CMD 中执行命令（经过安全过滤）
 
@@ -984,7 +1012,7 @@ class ChatSession:
             命令执行结果（stdout 或 stderr）
         """
         # Windows 危险命令黑名单（大小写不敏感）
-        dangerous_patterns = [
+        windows_dangerous_patterns = [
             # 删除命令
             r"\bdel\b", r"\berase\b", r"\brmdir\b", r"\brd\b",
             # 格式化
@@ -1000,43 +1028,78 @@ class ChatSession:
             # 系统关机
             r"\bshutdown\b", r"\btaskkill\s+/f\b", r"\btskill\b"
         ]
+
+        # Linux 核心危险命令黑名单（精简版）
+        linux_dangerous_patterns_core = [
+            # 最危险的删除/格式化命令
+            r"\brm\s+-rf\b", r"\brmdir\b", r"\bdd\b", r"\bmkfs\b", r"\bfdisk\b",
+
+            # 权限提升
+            r"\bsudo\b", r"\bsu\b", r"\bpasswd\b",
+
+            # 系统控制
+            r"\breboot\b", r"\bshutdown\b", r"\bpoweroff\b", r"\bhalt\b",
+            r"\bkill\s+-9\b", r"\bpkill\b",
+
+            # 远程执行（危险组合）
+            r"\bwget\s+\S+\s+\|\s+sh\b", r"\bcurl\s+\S+\s+\|\s+sh\b",
+
+            # 服务禁用
+            r"\bsystemctl\s+disable\b", r"\bchkconfig\s+off\b",
+
+            # 防火墙关闭
+            r"\biptables\s+-F\b", r"\bufw\s+disable\b", r"\bsetenforce\s+0\b",
+        ]
+        is_windows = platform.system() == "Windows" # 判断操作系统
+
+        if is_windows:
+            dangerous_patterns = windows_dangerous_patterns
+        else:
+            dangerous_patterns = linux_dangerous_patterns_core
+
         if any(re.search(pattern, command, re.IGNORECASE) for pattern in dangerous_patterns):
             return "[ERROR]禁止执行该命令"
+        
         command_lower = command.lower().strip()
 
         if not command_lower:
             return "[ERROR]命令不能为空"
 
-        is_powershell = command_lower.strip().startswith('powershell') or command_lower.strip().startswith('pwsh')
-        is_nodejs = 'node' in command_lower.lower() and command_lower.lower().endswith('.js')
-        if is_powershell:
+        
+        # 使用 powershell 执行命令，过滤危险命令
+        if command_type == "powershell" or command_lower.startswith("powershell"):
             ps_dangerous = ["-enc", "-encodedcommand", "invoke-expression", "iex", "downloadfile", "downloadstring"]
             if any(d in command_lower for d in ps_dangerous):
                 return "[ERROR]PowerShell 命令包含潜在危险操作，已被拒绝。" 
+            if not command_lower.startswith("powershell"):
+                command = f"powershell -command {command}"
+
+        is_default_cmd = command_type == "cmd" and not command_lower.startswith("powershell")
+    
+        
         try:
             # Windows 下使用 shell=True 会调用 cmd.exe
-            if is_nodejs:
-                command = f'powershell -Command "{command}"'
+            cp_env = os.environ.copy()
+            cp_env['PYTHONIOENCODING'] = 'utf-8'
+            run_coding = "gbk" if is_windows and is_default_cmd else 'utf-8'
+
             result = subprocess.run(
                 command,
                 shell=True,
                 capture_output=True,
                 text=True,
                 timeout=20,
-                encoding='gbk',
+                encoding=run_coding,
                 errors='replace',
                 cwd=WORKSPACE_DIR,
-                env=os.environ.copy()  # 继承系统环境变量
+                env=cp_env  # 继承系统环境变量
             )
 
             # 处理输出编码问题（Windows CMD 默认 GBK）
-            try:
-                stdout = result.stdout.encode('gbk', errors='ignore').decode('gbk')
-                stderr = result.stderr.encode('gbk', errors='ignore').decode('gbk')
-            except:
-                stdout = result.stdout
-                stderr = result.stderr
-
+            
+            stdout = result.stdout
+            stderr = result.stderr
+            
             if result.returncode == 0:
                 return stdout if stdout else "(命令执行成功，无输出)"
             else:
@@ -1086,7 +1149,9 @@ class ChatSession:
     def write_file(self, path: str, content: str) -> str:
         """保存信息到用户本地文件"""
         if not os.path.isabs(path):
-            file_path = os.path.join(WORKSPACE_DIR, path)
+            if path.find(WORKSPACE_DIR) < 0:
+                path = os.path.join(WORKSPACE_DIR, path)
+            file_path = os.path.abspath(path)
         else:
             file_path = path
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
@@ -1112,7 +1177,9 @@ class ChatSession:
             操作结果信息
         """
         if not os.path.isabs(path):
-            source_file_path = os.path.join(WORKSPACE_DIR, path)
+            if path.find(WORKSPACE_DIR) < 0:
+                path = os.path.join(WORKSPACE_DIR, path)
+            source_file_path = os.path.abspath(path)
         else:
             source_file_path = path.removeprefix("file:///")
         
@@ -1163,7 +1230,9 @@ class ChatSession:
     def append_file(self,path: str, content: str) -> str:
         """追加信息到用户本地文件"""
         if not os.path.isabs(path):
-            file_path = os.path.join(WORKSPACE_DIR, path)
+            if path.find(WORKSPACE_DIR) < 0:
+                path = os.path.join(WORKSPACE_DIR, path)
+            file_path = os.path.abspath(path)
         else:
             file_path = path
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
@@ -1178,7 +1247,9 @@ class ChatSession:
     def insert_file_at_line(self,path, line_number:int, content:str):
         """在指定行号前插入文本"""
         if not os.path.isabs(path):
-            file_path = os.path.join(WORKSPACE_DIR, path)
+            if path.find(WORKSPACE_DIR) < 0:
+                path = os.path.join(WORKSPACE_DIR, path)
+            file_path = os.path.abspath(path)
         else:
             file_path = path
         try:
@@ -1214,7 +1285,9 @@ class ChatSession:
         if path.startswith("@skill/") and self.active_skill: # 针对skill目录下的文件情况
             file_path = os.path.join(self.active_skill.path, path.removeprefix("@skill/"))
         elif not os.path.isabs(path):
-            file_path = os.path.join(WORKSPACE_DIR, path)
+            if path.find(WORKSPACE_DIR) < 0:
+                path = os.path.join(WORKSPACE_DIR, path)
+            file_path = os.path.abspath(path)
         else:
             file_path = path.removeprefix("file:///")
         file_size = 0
@@ -1238,7 +1311,9 @@ class ChatSession:
         if path.startswith("@skill/") and self.active_skill: # 针对skill目录下的文件情况
             file_path = os.path.join(self.active_skill.path, path.removeprefix("@skill/"))
         elif not os.path.isabs(path):
-            file_path = os.path.join(WORKSPACE_DIR, path)
+            if path.find(WORKSPACE_DIR) < 0:
+                path = os.path.join(WORKSPACE_DIR, path)
+            file_path = os.path.abspath(path)
         else:
             file_path = path.removeprefix("file:///")
         try:
@@ -1323,13 +1398,15 @@ class ChatSession:
         if self.active_skill: # 激活技能情况下，读取技能目录下的memory.md文件
             user_memory = self.read_file("memory.md")
             if not user_memory or user_memory.strip().startswith("[ERROR]读取文件失败"):
-                server_console.print("ℹ️没有在工作区memory.md中维护用户使用习惯")
+                server_console.print(" ℹ️ 没有在工作区memory.md中维护用户使用习惯")
                 user_memory = "[暂无]"
         skills_list = "\n".join([f"- {s['name']}: {s['description']}" for s in self.skills_meta])
-        base1 = f"""你是一个智能助手（性格：不装，说干就干）, 运行的系统为{platform.system()}(Now:{datetime.now().strftime('%Y-%m-%d %H:%M:%S')})，可以通过输出特定格式的文本调用工具、技能或MCP服务。
+        base1 = f"""[Now:{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]  
+## 角色定义
+你是一个智能助手（风格：不装、说干就干、基于现有数据、不捏造信息）, 运行的系统为{platform.system()}，可以通过输出特定格式的文本调用工具、技能或MCP服务。
+
 ## 核心工作
 根据用户的问题、用户的技能工具使用习惯(如果有)，立刻选择合适的工具、技能或MCP服务进行调用；如果无需调用，或无匹配工具、技能或MCP服务情况，直接根据用户问题进行回答即可。
-
 
 ## 当前用户技能工具使用习惯
 {user_memory}
@@ -1343,7 +1420,7 @@ class ChatSession:
 ## 可用工具
 1. `skill_call` - 调用技能。参数：{{"skill_name": "...", "user_request": "..."}}
 2. `mcp_call` - 调用MCP服务中的工具。参数：{{"server_name": "...","user_request": "..."}}
-3. `execute_bash` - 执行bash/cmd命令(根据当前系统)。参数：{{"command": "..."}}
+3. `execute_bash` - 执行bash/cmd/powershell命令(根据当前系统)。参数：{{"command": "...","command_type": "bash/cmd/powershell"}}
 4. `read_file` - 读取文件、`read_file_with_lineno` - 读取文件(返回的内容带行号) 。参数：{{"path": "..."}}。
     - 文件限制：只能读取`.txt`, `.md`, `.json`, `.yaml/.yml`, `.csv/.tsv`, `.log`, `.sql`, `ini`, `toml`, `py`, `js`, `html`, `xml`源文件，其他类型文件由其他工具处理.
 5. `append_file` - 追加方式写入文件。参数：{{"path": "...", "content": "..."}}
@@ -1358,7 +1435,7 @@ class ChatSession:
 格式举例例如：  
 <tool_call>skill_call {{"skill_name": "xx—skill", "user_request": "提取sample.pdf文本"}}</tool_call>  
 <tool_call>mcp_call {{"server_name": "xx_mcp", "user_request": "查询用户xxx信息"}}</tool_call>   
-<tool_call>execute_bash {{"command": "where xx"}}</tool_call>  
+<tool_call>execute_bash {{"command": "where xx","command_type": "cmd"}}</tool_call>  
 <tool_call>read_file {{"path": "./xx.md"}}</tool_call>  
 <tool_call>append_file {{"path": "./xx.md", "content": "追加内容"}}</tool_call>  
 <tool_call>execute_script {{"script_name": "xx.py", "args": ["arg1", "arg2"], "timeout": 40}}</tool_call>  
@@ -1378,7 +1455,10 @@ class ChatSession:
         - 如果文件路径为相对路径，则需要在前面补齐`@skill/`前缀，如`readme.md` -> `@skill/readme.md`, `doc/xx.txt` -> `@skill/doc/xx.txt`
 
 """     
-        base2 = f"""你是一个智能助手（性格：不装，说干就干）, 运行的系统为{platform.system()}(Now:{datetime.now().strftime('%Y-%m-%d %H:%M:%S')})，可以根据用户需求进行回答或调用工具/技能/MCP服务。
+        base2 = f"""[Now:{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]  
+## 角色定义      
+你是一个智能助手（风格：不装、说干就干、基于现有数据、不捏造信息）, 运行的系统为{platform.system()}，可以根据用户需求进行回答或调用工具/技能/MCP服务。
+
 ## 核心工作
 根据用户的问题、用户的技能工具使用习惯(如果有)，选择合适的工具、技能或MCP服务进行调用；如果无需调用，或无匹配工具、技能或MCP服务情况，直接根据用户问题进行回答即可。
 可使用的工具列表已通过`tools`参数传入，请根据用户问题选择合适的工具进行调用。
@@ -1421,10 +1501,11 @@ class ChatSession:
         """ 生成MCP Chat的系统信息 """
         user_memory = self.read_file("memory.md")
         if not user_memory or user_memory.strip().startswith("[ERROR]读取文件失败"):
-            server_console.print("ℹ️ 没有在工作区memory.md中维护用户使用习惯")
+            server_console.print(" ℹ️ 没有在工作区memory.md中维护用户使用习惯")
             user_memory = "[暂无]"
-        return f"""## 角色定义及能力
-你是一个有用的智能助手(Now:{datetime.now().strftime('%Y-%m-%d %H:%M:%S')})，能够访问以下工具:
+        return f"""[Now:{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]
+## 角色定义及能力
+你是一个有智能助手（风格：不装、说干就干、基于现有数据、不捏造信息），能够访问以下工具:
 {tools_description}
 ## 核心工作
 请基于用户请求、历史对话及用户的技能工具使用习惯(如果有)，选择最合适的工具，并生成一个JSON对象来调用该工具；如果没有合适的工具, 直接返回"没有匹配的工具"。  
@@ -1459,7 +1540,7 @@ class ChatSession:
             try:
                 await server.initialize()
             except Exception as e:
-                error_console.print(f"❌ Error for server {server.name}. {str(e)}")
+                error_console.print(f" ❌ 初始化MCP服务 {server.name} 失败. {str(e)}")
                 self.invalid_servers.add(server)
     
     async def reinitialize_servers(self,new_servers: list[Server]) -> None:
@@ -1471,7 +1552,7 @@ class ChatSession:
                 server.exit_stack = AsyncExitStack()
                 await server.initialize()
             except Exception as e:
-                error_console.print(f"❌ Error for server {server.name}. {str(e)}")
+                error_console.print(f"❌ 初始化MCP服务{server.name}. {str(e)}")
                 self.invalid_servers.add(server)
 
     def showSysInfo(self,msg:str|Markdown|Text,title:str,subtitle:str=None):
@@ -1523,16 +1604,18 @@ class ChatSession:
         获取AI模型相关信息
         """
         fillMarks_len = (console.width - (len(self.llm_client.ai_channel)+len(self.llm_client.ai_model)+len(self.llm_client.ai_provider)+36))//2 - 10
-        modleInfo = Text(justify="center")
-        modleInfo.append("─"*fillMarks_len+"    " if fillMarks_len>0 else "",style="yellow")
-        modleInfo.append(self.llm_client.ai_channel,style="blue")
-        modleInfo.append("  |  ")
-        modleInfo.append(self.llm_client.ai_model,style="blue")
-        modleInfo.append("  |  ")
-        modleInfo.append(self.llm_client.ai_provider,style="blue")
-        modleInfo.append("  |  ")
-        modleInfo.append(f"{'AGENT ON' if self.agent_switch==1 else 'AGENT OFF'}",style="blue")
-        modleInfo.append("    "+"─"*fillMarks_len if fillMarks_len>0 else "",style="yellow")
+        modleInfo = ""
+        modleInfo+="─"*fillMarks_len + ("  " if fillMarks_len>0 else "")
+        modleInfo+=self.llm_client.ai_channel
+        modleInfo+="  |  "
+        modleInfo+=self.llm_client.ai_model
+        modleInfo+="  |  "
+        modleInfo+=self.llm_client.ai_provider
+        modleInfo+="  |  "
+        modleInfo+=f"{'AGENT ON' if self.agent_switch==1 else 'AGENT OFF'}"
+        modleInfo+=("  " if fillMarks_len>0 else "") + "─"*fillMarks_len
+        margin_fix = " " * max((console.width - len(modleInfo))//2,0)
+        modleInfo=margin_fix + modleInfo
         return modleInfo
 
     async def showAndGetAssistantResponse(self,call_llm: callable,subtitle:str=None)->typing.Tuple[str,dict|None,str|None]:
@@ -1581,7 +1664,7 @@ class ChatSession:
             live.update(assistant_panel,refresh=True)
         if tool_calls and not result.strip():
             func_names = [func.get('function',{}).get("name","API格式不匹配") for func in tool_calls]
-            result = f"🔔 返回了一些工具: {",".join(func_names)} ..."
+            result = f"🔔 我找到一些工具需要调用: {",".join(func_names)} ..."
         if not tool_calls and not result.strip():
             result = "[Error] Received empty response from LLM"
         return result,tool_calls,reasoning_content
@@ -1622,26 +1705,27 @@ class ChatSession:
                             reasoningContent+=chunk
                         else: # 将新内容追加到文本对象
                             src_response += chunk
-                            assistant_panel = self.assistantResponse(Markdown(src_response.strip(), code_theme=self.markdown_theme),escape("Press [/] to Cancel"))
+                            resp_lines = src_response.splitlines()
+                            show_content = ("...  \n" if len(resp_lines) > 10 else "")+ "\n".join(resp_lines[-10:])
+                            assistant_panel = self.assistantResponse(show_content,escape("Press [/] to Cancel"))
                             live.update(assistant_panel, refresh=True)
                         await asyncio.sleep(0.05)  # 降低 CPU 占用
                         continue
                     break
             except (asyncio.CancelledError,Exception) as e:
-                src_response = f"⚠️ Exception Occurred：{traceback.format_exc()}"
+                src_response = f" ⚠️ 发生了异常：{traceback.format_exc()}"
                 error_console.print(src_response)
             finally:
                 input_obj.close()
                 elapsed = asyncio.get_running_loop().time() - start_time
             cost_info = f"✅ Cost {elapsed:.2f} Sec"
-            # print("大模型直接回答",src_response)
             if len(tool_calls)>=1:
                 tool_calls[-1]["function"]["arguments"]=tool_args_str
                 if not src_response.strip():
                     func_names = [func["function"].get("name","API格式不匹配") for func in tool_calls]
-                    src_response = f"🔔 返回了一些工具: {",".join(func_names)} ..."
-            if len(tool_calls) == 0 and not src_response.strip():
-                src_response = "[Error] Received empty response from LLM"
+                    src_response = f"🔔 我找到一些工具需要调用: {",".join(func_names)} ..."
+            elif not src_response.strip():
+                src_response = "[Error] 大模型没有进行任何回复，可能出现了异常，可重新开始新的对话"
             assistant_panel = self.assistantResponse(Markdown(src_response.strip(), code_theme=self.markdown_theme),cost_info)
             live.update(assistant_panel, refresh=True)
         
@@ -1681,7 +1765,7 @@ code_theme=self.markdown_theme
         """
         model_info = self.client_models.get(model_no)
         if not model_info:
-            error_console.print(f"❌ Invalid model number: {model_no}")
+            error_console.print(f" ❌ 无效的模型编号: {model_no}")
             return
         if model_info["api_style"].lower() == "openai":
             self.llm_client = LLMClient(api_key=model_info["api_key"],
@@ -1695,7 +1779,7 @@ code_theme=self.markdown_theme
                                         support_multimodal=model_info.get("support_multimodal",False),
                                         http_proxy=model_info["api_proxy"])
         else:
-            error_console.print(f"❌ Unsupport AI API STYLE: {model_info["api_style"]}")
+            error_console.print(f" ❌ 不支持的AI API 风格: {model_info["api_style"]}")
       
 
     async def cleanup_servers(self) -> None:
@@ -1721,7 +1805,7 @@ code_theme=self.markdown_theme
             try:
                 mcp_prompts = await server.list_prompts()
             except RuntimeError as e:
-                error_console.print(f"❌ Failed to list prompts from {server.name}. {str(e)}")
+                error_console.print(f" ❌ 无法从此MCP服务获取prompts列表 - {server.name}. {str(e)}")
                 continue
             if not mcp_prompts:
                 continue
@@ -1832,13 +1916,18 @@ code_theme=self.markdown_theme
     
     def showTitle(self):
         # patorjk.com
-        margin_left_len = (server_console.width-33)//2-1
+        margin_left_len = (server_console.width-30)//2-1
         server_console.print(
             " "*margin_left_len+"┏┳┓•      ┏┓┓       ┏┓┓•     "+"\n"+
             " "*margin_left_len+" ┃ ┓┏┓┓┏  ┃ ┃┏┓┓┏┏  ┃ ┃┓┏┓┏┓╋"+"\n"+
             " "*margin_left_len+" ┻ ┗┛┗┗┫  ┗┛┗┗┻┗┻┛  ┗┛┗┗┗ ┛┗┗(v2.0)"+"\n"+
             " "*margin_left_len+"       ┛                     "
         )
+        self.showSysInfo(("[blue]对话[/blue]: 输入查询信息，等待大模型回答\n"
+            "[blue]功能[/blue]: AI对话，调用工具、MCP、SKILLS、联网搜索\n"
+            "[blue]命令[/blue]: 输入【/】联想命令列表, 使用【↑↓】·【Enter】确定\n" 
+            "[blue]输入[/blue]: 按键【Esc】使用VI模式: 【o】换行, 【g·g】回开头,【a】【i】插入 ..."),
+            "[快速开始]",subtitle="输入 /help 💡") # 展示当前模型信息
 
     def creatNewLog(self):
         """
@@ -1858,7 +1947,7 @@ code_theme=self.markdown_theme
         """
         if self.log_file.name != f"logs/{datetime.now().strftime('%Y%m%d')}.md": # 如果当前日志文件不是今天的日志文件，则创建一个新的日志文件
             self.creatNewLog()
-        log = f"# {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}[{role}]:  \n{info}  \n---\n"
+        log = f"# {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}[{role}]:  \n{info}  \n\n---  \n\n"
         
         self.log_file.write(log)
         self.log_file.flush()
@@ -1918,6 +2007,8 @@ code_theme=self.markdown_theme
             {
                 "frame.border": "#884444",
                 "accepted frame.border": "gray",
+                'bottom-toolbar': 'bg:#ansimagenta bold',
+                'toolbar.info': '#ansicyan',  # 自定义更细粒度的样式类
             }
         )
         try:
@@ -1933,38 +2024,37 @@ code_theme=self.markdown_theme
 
             # help
             help_items=[
-                ("User Input","Type [Esc] to use vi command: [b]o[/b] newline, [b]g[/b]·[b]g[/b] home, [b]a[/b] or [b]i[/b] insert..."),
-                ("Use Command","Type [b]/[/b] show commands, type [Tab]·[↑][↓] select and type [Enter]."),
-                ("Use Prompts", "Type [Tab] or content show Completions, use [↑][↓] select and type [Enter] to choose prompts."),
-                ("Log Path",f"start \"{os.path.abspath(self.log_file.name)}\"" if self.log_file else 'No log file'),
-                ("Configs","\".env\" file supplies enveronment variables; \"configs.json\" file supplies llm models and mcp servers.")
+                ("关于输入","键入【Esc】使用VI命令: [b]o[/b] 换行, [b]g[/b]·[b]g[/b] 回开头, [b]a[/b]或[b]i[/b]插入..."),
+                ("使用命令","键入[b]/[/b]显示命令列表, 键入[Tab]·[↑][↓]选择，键入[Enter]确认."),
+                ("关于MCP Prompts", "输入命令/usmp后, 键入[Tab]或内容显示选项, 使用[↑][↓]·[Enter]确认."),
+                ("关于Configs","\".env\": 环境遍历; \"configs.json\": 配置AI大模型及MCP服务、网络搜索")
             ]
             # 命令处理格式
             commands_item=[
-                ("/agent","start agent mode"),
-                ("/agent-off","close agent mode"),
-                ("/lst","list tools"),
-                ("/smtd *","show mcp tool details"),   
-                ("/lsmp","list mcp prompts"),    
-                ("/smpd *","show mcp prompt details"),
-                ("/snc","start new chat"),
-                ("/cls","clean screen"),
-                ("/clh","clean input history"),
-                ("/usmp","use mcp prompt"),
-                ("/swt","switch theme"),
-                ("/swm","switch model"),  
-                ("/img","upload image for chat(only multimodal-support LLM)"),
-                ("/reload","reload llm models and mcp servers"),
-                ("/stu","show tokenUsage"),
-                ("/help","show helps"),
-                ("/exit","exit client")
+                ("/agent","开启agent模式"),
+                ("/agent-off","关闭agent模式"),
+                ("/lst","列出所有工具"),
+                ("/smtd *","显示MCP工具详情"),   
+                ("/lsmp","列出MCP Prompts"),    
+                ("/smpd *","显示MCP Prompt详情"),
+                ("/snc","开始新对话"),
+                ("/cls","清理屏幕"),
+                ("/clh","清理输入历史"),
+                ("/usmp","使用MCP Prompt"),
+                ("/swt","切换Markdown主题"),
+                ("/swm","切换AI大模型"),  
+                ("/img","上传图片(仅支持多模态的大模型)"),
+                ("/reload","重新加载配置文件"),
+                ("/stu","显示本轮对话Token使用量"),
+                ("/help","显示帮助信息"),
+                ("/log","查看日志文件路径"),
+                ("/exit","退出本应用")
             ]
             short_commands_map={x:HTML(f"<red>{x}</red>:{y}") for x,y in commands_item}
             short_commands = [k[0] for k in commands_item]
             # 开头的帮助提示信息
             
             self.showTitle()
-            self.showSysInfo(self.getAIModelInfo(),"[Current AI Model]",subtitle="type /help 💡") # 展示当前模型信息
             
             # 具体的工具及变量信息
             all_tools = []
@@ -2046,25 +2136,25 @@ code_theme=self.markdown_theme
                     cmd_completer = WordCompleter(short_commands, display_dict=short_commands_map,ignore_case=True,match_middle=False,sentence=True)
                     user_input = (await input_session.prompt_async(HTML("⌨︎ <cyan> > </cyan>"), completer=cmd_completer,
                                                                    multiline=False,vi_mode=True,
-                                                                   bottom_toolbar="▪ Type [/] to show commands ▪ Type [Esc] to use vi mode ▪",
+                                                                   bottom_toolbar=self.getAIModelInfo(),
                                                                    show_frame=is_done,
                                                                    style=prompt_style)).strip()
 
                     if not user_input:
-                        error_console.print("⚠️ You Need Input Something...")
+                        error_console.print(" ⚠️ 你需要输入内容...")
                         continue
                     if user_input.startswith("/") and user_input.split(" ")[0].lower() not in [c.split(" ")[0] for c in short_commands]:
-                        error_console.print("⚠️ Invalid Command")
+                        error_console.print(" ⚠️ 无效命令...")
                         continue
                     if user_input.lower() in ["/smtd","/smpd"]:
-                        error_console.print("⚠️ Your Command Is Not Complete...")
+                        error_console.print(" ⚠️ 命令不完整...")
                         continue
                     if user_input.lower() == "/help":
                         self.showItemIn3Cols("[Help]",[f"[bold blue]{s}[/bold blue]: {d}" for s,d in help_items],cols=1)
                         continue
                     if user_input.lower() == "/lst":
                         if self.agent_switch == 0:
-                            error_console.print("⚠️ Please Turn On Agent First...")
+                            error_console.print(" ⚠️ 需要先开启Agent模式...")
                             continue
                         self.showSysInfo(base_tools_nameFormat,"[Base Tools]")
                         self.showSysInfo(tools_name,"[MCP Tools]")
@@ -2077,7 +2167,7 @@ code_theme=self.markdown_theme
                         continue
                     if user_input.lower().startswith("/smtd "):
                         if self.agent_switch == 0:
-                            error_console.print("⚠️ Please Turn On Agent First...")
+                            error_console.print(" ⚠️ 需要先开启Agent模式...")
                             continue
                         prompt_name = user_input[6:].strip()
                         tool_name = user_input[6:].strip()
@@ -2086,7 +2176,7 @@ code_theme=self.markdown_theme
                         continue
                     if user_input.lower().startswith("/smpd "):
                         if self.agent_switch == 0:
-                            error_console.print("⚠️ Please Turn On Agent First...")
+                            error_console.print(" ⚠️ 需要先开启Agent模式...")
                             continue
                         prompt_name = user_input[6:].strip()
                         prompts_details = self.get_prompt_details(all_prompts,prompt_name)
@@ -2103,43 +2193,43 @@ code_theme=self.markdown_theme
                             self.messages.append({"role": "system", "content": self.gen_agent_system_content(mcp_when_to_use)})
                         else:
                             self.messages.append({"role": "system", "content": self.gen_chat_system_content()})
-                        server_console.print("ℹ️ Started New Chat ...")
+                        server_console.print(" ℹ️ 开始了新对话 ...")
                         # log
                         self.log_file.write("\n\n\n-----------------Started New Chat------------------\n\n\n")
                         continue
                     if user_input.lower() == '/agent':
                         if self.agent_switch == 1:
-                            server_console.print("ℹ️ Agent Switch Is Already ON...")
+                            server_console.print(" ℹ️ 需要先开启Agent模式...")
                             continue
                         # 加载Skills
                         self.skills_meta=load_skills_metadata()
-                        server_console.print("ℹ️ Skills Are Loaded ...")
+                        server_console.print(" ℹ️ Skills已经加载...")
                         # 启动配置的servers
                         await self.initialize_servers() # 启动MCP
                         await load_mcp_servers_info()
-                        server_console.print("ℹ️ MCP Servers Are Loaded ...")
+                        server_console.print(" ℹ️ MCP服务已经加载...")
                         self.messages[0]={"role": "system", "content": self.gen_agent_system_content(mcp_when_to_use)}
                         chat_start_time = datetime.now()
                         self.agent_switch = 1
-                        server_console.print("ℹ️ Agent Switch Is ON ...")
+                        server_console.print(" ℹ️ Agent模式已经开启...")
                         continue
                     if user_input.lower() == '/agent-off':
                         # 清空Skills
                         self.active_skill = None
                         self.skills_meta = []
-                        server_console.print("ℹ️ Skills Are Cleared ...")
+                        server_console.print(" ℹ️ Skills已经加载...")
                         # 关闭配置的servers
                         await self.cleanup_servers() # 关闭MCP
-                        server_console.print("ℹ️ MCP Servers Are Closed ...")
+                        server_console.print(" ℹ️ MCP服务已经关闭...")
                         self.messages[0]={"role": "system", "content": self.gen_chat_system_content()}
                         chat_start_time = datetime.now()
                         self.agent_switch = 0
-                        server_console.print("ℹ️ Agent Switch Is OFF ...")
+                        server_console.print(" ℹ️ Agent模式已经关闭...")
                         continue
                     if user_input.lower() == "/clh":
                         input_session.history._loaded_strings = []
                         prmt_session.history._loaded_strings = []
-                        server_console.print("ℹ️ Cleaned Input History ...")
+                        server_console.print(" ℹ️ 已经清理输入历史...")
                         continue
                     if user_input.lower() == "/cls":
                         if os.name == 'posix':  # Unix/Linux/Mac
@@ -2147,7 +2237,6 @@ code_theme=self.markdown_theme
                         elif os.name in ('nt', 'dos'):  # Windows
                             os.system('cls')
                         self.showTitle()
-                        self.showSysInfo(self.getAIModelInfo(),"[Current AI Model]",subtitle="type /help 💡") # 展示当前模型信息
                         continue
                     if user_input.lower() == "/swm":
                         models_options = [(no,HTML(f"<ansiblue>{model['ai_channel']}</ansiblue> | <ansiblue>{model['ai_model']}</ansiblue> | <ansiblue>{model['ai_provider']}</ansiblue>")) for no, model in self.client_models.items()]
@@ -2160,9 +2249,9 @@ code_theme=self.markdown_theme
                         )
                         result = await input_selection.prompt_async()
                         self.switch_model(result)
-                        server_console.print(f"ℹ️ AI model is swithed to \"{escape(self.llm_client.ai_model)}\", "
-                                             f"Channel:\"{escape(self.llm_client.ai_channel)}\", "
-                                             f"Provider:\"{escape(self.llm_client.ai_provider)}\"!")
+                        server_console.print(f" ℹ️ AI大模型已经切换到 \"{escape(self.llm_client.ai_model)}\", "
+                                             f"频道:\"{escape(self.llm_client.ai_channel)}\", "
+                                             f"提供方:\"{escape(self.llm_client.ai_provider)}\"!")
                         self.usage ={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
                         del self.messages[:] # 清空对话历史
                         img_path_list.clear()
@@ -2183,7 +2272,7 @@ code_theme=self.markdown_theme
                         continue    
                     if user_input.lower() == "/lsmp":
                         if self.agent_switch == 0:
-                            error_console.print("⚠️ Please Turn On Agent First...")
+                            error_console.print(" ⚠️ 需要先开启Agent模式...")
                             continue
                         self.showSysInfo(prompts_name,"[Prompt List]")
                         continue
@@ -2194,14 +2283,14 @@ code_theme=self.markdown_theme
                         if chose_theme not in code_themes:
                             continue
                         self.markdown_theme = chose_theme
-                        server_console.print(f"ℹ️ Switched to markdown theme: {chose_theme.replace('[','[[').replace(']',']]')}")
+                        server_console.print(f" ℹ️ Markdown主题切换到了: {chose_theme.replace('[','[[').replace(']',']]')}")
                         continue
                     if user_input.lower() == "/reload":
                         try:
                             self.base_configs.clear()
                             self.base_configs = config.load_config("configs.json") # 重新读取Severs配置
                         except Exception as e:
-                            error_console.print(f"❌ Failed to load configs.json: {e}")
+                            error_console.print(f" ❌ 加载configs.json失败: {e}")
                             self.base_configs = {"llm_models": [], "mcp_servers": [], "web_search":{}}
                             continue
                         # 初始化llm_client列表
@@ -2220,51 +2309,60 @@ code_theme=self.markdown_theme
                             await self.reinitialize_servers(new_servers)
                             await load_mcp_servers_info()
                             self.messages[0] = {"role": "system", "content": self.gen_agent_system_content(mcp_when_to_use)}
-                            server_console.print("🖥️ Reloaded LLM Models and Servers, re-switch model to effect ...")
+                            server_console.print(" 🖥️ 重新加载了MCP服务及AI大模型配置, 重新切换大模型可生效 ...")
                         else:
-                            server_console.print("🖥️ Reloaded LLM Models, re-switch model to effect ...")
+                            server_console.print(" 🖥️ 重新加载了AI大模型配置, 重新切换大模型可生效 ...")
+                        continue
+                    if user_input.lower() == "/log":
+                        log_path = os.path.abspath(self.log_file.name).replace("\\","/")
+                        self.showSysInfo(Markdown(f"📄 [{log_path}]({log_path})"),"[Log File Path]")
+                        continue
+                    if user_input.lower() == "/help":
                         continue
                     if user_input.lower() == "/exit":
-                        server_console.print("🖥️ Exiting...")
+                        server_console.print(" 🖥️ 应用退出中...")
                         break
                     if user_input.lower() == "/img":
                         if self.agent_switch==0:
-                            error_console.print("⚠️ Please Turn On Agent First...")
+                            error_console.print(" ⚠️ 需要先开启Agent模式...")
                             continue
                         if not self.llm_client.support_multimodal:
-                            error_console.print("⚠️ This Model Not Support Image...")
+                            error_console.print(" ⚠️ 此大模型不支持图片...")
                             continue
                         img_path_list = []
                         while True:
-                            img_path = Prompt.ask("🖼️ Enter Image Paths(Input '/' to end)")
+                            img_path = Prompt.ask(" 🖼️ 输入图片路径(输入'/'终止)")
                             if img_path.strip() == "/":
                                 break
                             img_path = img_path.strip().strip("&").strip().strip('"').strip("'")
                             if not os.path.isfile(img_path) \
                                 or not img_path.lower().endswith(('.png', '.jpg', '.jpeg')):
-                                error_console.print("❌ File not found or not support(only png/jpg/jpeg)...")
+                                error_console.print(" ❌ 文件不存在或格式不支持(仅png/jpg/jpeg)...")
+                                continue
+                            if os.path.getsize(img_path) / 1024 > 1024*1:
+                                error_console.print(" ❌ 文件太大了(max 1MB)...")
                                 continue
                             img_path_list.append(img_path)
                         continue      
                     # 使用server提供的prompts,此项必须在最后位置
                     if user_input.lower() == "/usmp":
                         if self.agent_switch==0:
-                            error_console.print("⚠️ Please Turn On Agent First...")
+                            error_console.print(" ⚠️ 需要先开启Agent模式...")
                             continue
-                        server_console.print("[bold]Press [Tab] or content to show Completions[/bold](Use [↑][↓]·[Enter] Submit)")
+                        server_console.print(" 键入【Tab】或内容联想，使用[↑][↓]·[Enter]确定)")
                         word_completer = WordCompleter([prompt.name for prompt in all_prompts], ignore_case=True,match_middle=True)
                         prm_input = (await prmt_session.prompt_async("> ", completer=word_completer,multiline=False,vi_mode=True)).strip()
                         console.print("") # 增加一个空行
                         if prm_input not in word_completer.words:
-                            error_console.print("❌ Invalid Prompt Name...")
+                            error_console.print(" ❌ 无效的Prompt名称...")
                             continue
                         prompt_messages = await self.process_use_prompt(prm_input)
                         if not prompt_messages:
-                            error_console.print(f"❌ Can't get Prompt - {prm_input} from MCP Servers...")
+                            error_console.print(f" ❌ 无法从MCP服务获取此Prompt - {prm_input}")
                             continue
                         # 超过1小时，重新开始
                         if (datetime.now() - chat_start_time).seconds > 60*60: 
-                            console.print("💡Chat timeout, start new chat.")
+                            console.print(" 💡 对话超时，开始新对话...")
                             del self.messages[1:]
                             img_path_list.clear()
                             # log
@@ -2290,7 +2388,7 @@ code_theme=self.markdown_theme
                                 self.appendInfo2Log("assistant",prompt_message.content.text)
                                 show_prompts.append(f"[green]Assistant[/green]: {prompt_message.content.text}")
                         if not show_prompts:
-                            error_console.print(f"❌ No text message from Prompt - {prm_input} from MCP Servers...")
+                            error_console.print(f" ❌ 无法从Prompt({prm_input})获取文本信息")
                             continue 
                         console.print("") # 增加一个空行
                         self.showSysInfo("\n".join(show_prompts),"[Used Prompt]")
@@ -2298,7 +2396,7 @@ code_theme=self.markdown_theme
                     elif user_input:
                         # 超过1小时，重新开始
                         if (datetime.now() - chat_start_time).seconds > 60*60:
-                            server_console.print("💡Chat timeout, start new chat.")
+                            server_console.print(" 💡 对话超时，开始新对话...")
                             del self.messages[1:]
                             img_path_list.clear()
                             # log
@@ -2309,10 +2407,10 @@ code_theme=self.markdown_theme
                             user_content = [{ "type": "text", "text": user_input}]
                             for img_path in img_path_list:
                                 try:
-                                    img_b64=image_to_base64(img_path)
+                                    img_b64=image_to_base64(img_path,max_size_kb=500)
                                     user_content.append({"type": "image_url", "image_url": {"url":img_b64}})
                                 except Exception as e:
-                                    error_console.print(f"⚠️ Can't convert image to base64 - {img_path} - {e}")
+                                    error_console.print(f" ⚠️ 无法将此图片转Base64 - {img_path} - {e}")
                                     continue
                             self.messages.append({"role": "user", "content": user_content})                         
                             img_path_list = []
@@ -2342,12 +2440,12 @@ code_theme=self.markdown_theme
                         # 最大任务循环次数限制
                         current_loop_count += 1
                         if current_loop_count > max_loop_count:
-                            error_console.print(f"⚠️ Tool Call Loop count exceed {max_loop_count} !")
+                            error_console.print(f" ⚠️ Tool调用迭代次数超过上限：{max_loop_count} !")
                             break
                         # 用户按键检测结束任务
                         for key in input_tc_obj.read_keys():
                             if key.data.upper() == '/':
-                                error_console.print(f"⚠️ Tool Call Loop break by user!")
+                                error_console.print(f" ⚠️ 用户中止了Tool调用迭代!")
                                 break
                         if self.active_skill: # 有激活的skill情况下，渐进式加载skill内容
                             self.messages[0] = {"role": "system", "content": self.gen_agent_system_content(mcp_when_to_use)}
@@ -2374,7 +2472,7 @@ code_theme=self.markdown_theme
                                     func_args = json.loads(tc["function"]["arguments"])
                                     functions.append({"id":tool_id, "name": func_name, "arguments": func_args})
                                 except Exception as e:
-                                    error_console.print(f"⚠️ 工具解析异常: {str(e)}")
+                                    error_console.print(f" ⚠️ 工具解析异常: {str(e)}")
                                     continue
                         # 添加assistant的基本信息
        
@@ -2404,7 +2502,7 @@ code_theme=self.markdown_theme
                             func_name = tc["name"]
                             func_args = tc["arguments"]
                             console.print("") # 增加一个空行
-                            server_console.print(f"[调用工具🛠️] {escape(func_name)} ，参数: {escape(str(func_args))}")
+                            server_console.print(f" [调用工具🛠️] {escape(func_name)} ，参数: {escape(str(func_args))}")
                             console.print("") # 增加一个空行
                             handler = self.tool_handlers.get(func_name)
                             if handler:
@@ -2433,7 +2531,7 @@ code_theme=self.markdown_theme
                             for tool_rst in tool_results:
                                 if not tool_rst["tool_call_id"]:
                                     continue
-                                self.messages.append({"role": "tool","tool_call_id": tool_rst["tool_call_id"], "content": tool_rst["content"]})
+                                self.messages.append({"role": "tool","tool_call_id": tool_rst["tool_call_id"], "content": str(tool_rst['content'])})
                                 # 写入日志
                                 self.appendInfo2Log("tool",f"**tool_call_id**:{tool_rst['tool_call_id']}; **content**:{tool_rst['content']}")  
                         else:
@@ -2445,7 +2543,7 @@ code_theme=self.markdown_theme
                             self.appendInfo2Log("user",user_content)    
         
                 except KeyboardInterrupt:
-                    server_console.print("💻 Exiting...")
+                    server_console.print(" 💻 应用退出...")
                     break
         finally:
             if self.log_file and not self.log_file.closed:
