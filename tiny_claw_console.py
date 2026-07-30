@@ -1256,7 +1256,7 @@ class ChatSession:
     def __init__(self) -> None:
         self.servers: list[Server] = []
         self.invalid_servers: set[Server] = set() # 将连接失败地服务器加入不可用中
-        self.llm_client: LLMClient | LLMClient2 | None  = None
+        self.llm_client: LLMClient | None  = None
         self.usage :dict = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         self.markdown_theme : str = code_themes[0]
         self.log_file = None
@@ -1997,202 +1997,6 @@ class ChatSession:
         self._batch_cleanup_pending = True
         return "...已完成一个任务，开始下一个..."
 
-    # ====================== 会话压缩与加载 ======================
-
-    async def _compact_session(self):
-        """压缩当前会话并保存到 his_sessions/ 目录"""
-        # 1. 确保 his_sessions 目录存在
-        his_dir = os.path.join(WORKSPACE_DIR, "his_sessions")
-        os.makedirs(his_dir, exist_ok=True)
-
-        # 2. 从 messages 中提取对话内容（跳过 system 消息）
-        conv_parts = []
-        for msg in self.messages:
-            role = msg.get("role", "")
-            if role == "system":
-                continue
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                texts = [x["text"] for x in content if x.get("type") == "text"]
-                content = " ".join(texts)
-            if not content or content.strip() == "":
-                content = "(无文本内容)"
-            # 截断过长的内容
-            if isinstance(content, str) and len(content) > 600:
-                content = content[:600] + "\n...[截断]..."
-            # 标记角色
-            role_label = {"user": "用户", "assistant": "助手"}.get(role, role)
-            conv_parts.append(f"## {role_label}\n{content}")
-
-            # 追加 reasoning_content（思考过程）
-            reasoning = msg.get("reasoning_content", "")
-            if reasoning:
-                if len(str(reasoning)) > 300:
-                    reasoning = str(reasoning)[:300] + "..."
-                conv_parts.append(f"[思考过程]: {reasoning}")
-
-            # 追加 tool_calls
-            tool_calls = msg.get("tool_calls")
-            if tool_calls:
-                tc_summary = []
-                for tc in tool_calls:
-                    fname = tc.get("function", {}).get("name", "?")
-                    tc_summary.append(f"调用 `{fname}`")
-                conv_parts.append(f"[工具调用]: {' → '.join(tc_summary)}")
-
-        conversation_text = "\n\n".join(conv_parts)
-        msg_count = sum(1 for m in self.messages if m.get("role") != "system")
-
-        # 3. 调用 LLM 生成压缩摘要
-        server_console.print(" 🧠 正在压缩会话（调用 AI 生成摘要）...")
-        compress_msgs = [
-            {"role": "system", "content": "你是一个会话压缩专家。请分析以下对话，生成结构化摘要。"},
-            {"role": "user", "content": f"""请分析以下会话（共 {msg_count} 条消息），生成结构化的 Markdown 摘要，包含：
-
-### Goal
-会话的高层目标 / 用户想要什么
-
-### Constraints
-用户设定的硬性约束、边界条件、不允许做的事
-
-### Progress
-
-#### Done
-已完成并验证的事项
-
-#### In Progress
-正在进行中但尚未完成的工作
-
-#### Blocked
-被卡住的事项、原因、解锁条件
-
-### Key Decisions
-架构选择、设计决策、技术权衡
-
-### Next step
-恢复工作时下一步要做什么（单行、具体）
-
----
-
-对话内容：
-
-{conversation_text}
-
----
-
-请只输出上述结构的 Markdown 内容，不要额外说明。如果某个字段没有对应内容，写「暂无」。"""
-            }
-        ]
-        try:
-            result, _, _, _ = await self.llm_client.get_response(compress_msgs, use_tool_call=False)
-        except Exception as e:
-            error_console.print(f" ❌ 压缩失败（AI 调用异常）: {e}")
-            return None
-
-        # 4. 从第一条用户消息中提取主题，生成文件名
-        first_user = ""
-        for msg in self.messages:
-            if msg.get("role") == "user":
-                c = msg.get("content", "")
-                if isinstance(c, list):
-                    c = " ".join(x["text"] for x in c if x.get("type") == "text")
-                first_user = c[:40]
-                break
-        topic = re.sub(r'[\\/:*?"<>|\n\r]', '_', first_user).strip()
-        topic = re.sub(r'_+', '_', topic)[:30] or "session"
-
-        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-        filename = f"session-{topic}-{timestamp}.md"
-        filepath = os.path.join(his_dir, filename)
-
-        # 5. 写入文件
-        model_name = getattr(self.llm_client, 'ai_model', 'N/A') if self.llm_client else "N/A"
-        agent_mode = {0: "关闭", 1: "Agent", 2: "Agent-Task"}.get(self.agent_switch, "N/A")
-        full_md = f"""# Compaction Relay
-
-> 自动压缩于: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-> 消息数: {msg_count} | 模型: {model_name} | Agent模式: {agent_mode}
-
----
-
-{result}
-
----
-
-## 元信息
-
-- **文件名**: `{filename}`
-- **原始消息数**: {msg_count}（系统消息不计）
-- **模型**: {model_name}
-- **Agent模式**: {agent_mode}
-- **工作目录**: `{WORKSPACE_DIR}`
-"""
-        with open(filepath, 'w', encoding='utf-8') as f:
-            f.write(full_md)
-
-        return filepath
-
-    async def _pick_session_file(self):
-        """让用户从 his_sessions/ 中选择一个会话文件（纯交互，无 status 干扰）"""
-        his_dir = os.path.join(WORKSPACE_DIR, "his_sessions")
-        if not os.path.isdir(his_dir):
-            error_console.print(f" ❌ 目录不存在: {his_dir}")
-            return None
-
-        files = sorted(
-            [f for f in os.listdir(his_dir) if f.startswith("session-") and f.endswith(".md")],
-            reverse=True
-        )
-        if not files:
-            error_console.print(" ❌ his_sessions/ 中没有已保存的会话文件")
-            return None
-
-        self.showItemIn3Cols(
-            "📂 已保存的会话文件",
-            [f"[cyan]{i+1}[/cyan]. {f}" for i, f in enumerate(files)],
-            cols=1
-        )
-        choice = Prompt.ask(
-            "[bold cyan]选择要加载的会话 (输入编号，或按 Enter 取消)[/bold cyan]",
-            default=""
-        )
-        if not choice.strip():
-            server_console.print(" ℹ️ 已取消加载")
-            return None
-
-        try:
-            idx = int(choice.strip()) - 1
-            if idx < 0 or idx >= len(files):
-                error_console.print(" ❌ 无效的编号")
-                return None
-        except ValueError:
-            error_console.print(" ❌ 请输入有效数字")
-            return None
-
-        return os.path.join(his_dir, files[idx]), files[idx]
-
-    async def _load_session_file(self, filepath, filename):
-        """读取已保存的会话文件并作为 assistant 消息插入到消息列表（不修改 system prompt，避免破坏缓存）"""
-        with open(filepath, 'r', encoding='utf-8') as f:
-            content = f.read()
-
-        load_message = f"""---
-## 已加载的压缩会话
-
-以下是从 `{filename}` 加载的之前压缩的会话摘要，可以基于此继续之前的任务：
-
-{content}
-
----"""
-
-        # 作为 assistant 消息插入到 system 消息之后
-        # 用 assistant 角色表示"这是已知的背景上下文"，避免连续 user 消息
-        if len(self.messages)>=2 and self.messages[0].get("role") == "system" and self.messages[1].get("role") != "assistant":
-            self.messages.insert(1, {"role": "assistant", "content": load_message})
-        else:
-            return None
-        return filename
-
     async def handle_ask_user(self, choices: list) -> str:
         """向用户展示各项选择，等待用户选择后返回结果。"""
         if not choices:
@@ -2489,24 +2293,9 @@ code_theme=self.markdown_theme
                                         support_thinking=model_info["support_thinking"],
                                         support_multimodal=model_info.get("support_multimodal",False),
                                         http_proxy=model_info["api_proxy"])
-        elif model_info["api_style"].lower() == "fosp":
-            fosp_keys = model_info["api_key"].split(",")
-            if len(fosp_keys)!=2:
-                error_console.print(f" ❌ 无效的FOSP API Key: {model_info['api_key']}, 应该是2个key(open_id & developer_secret) separated by comma")
-                return
-            self.llm_client = LLMClient2(fosp_open_id=fosp_keys[0],
-                                         fosp_developer_secret=fosp_keys[1],
-                                         ai_channel=model_info["ai_channel"],
-                                         ai_model=model_info["ai_model"],
-                                         ai_api_url=model_info["ai_api_url"],
-                                         ai_provider=model_info["ai_provider"],
-                                         support_tool_call=model_info["support_tool_call"],
-                                         support_stream=model_info["support_stream"],
-                                         support_thinking=model_info["support_thinking"],
-                                         http_proxy=model_info["api_proxy"])
         else:
             error_console.print(f" ❌ 不支持的AI API 风格: {model_info["api_style"]}")
-      
+            return
 
     async def cleanup_servers(self) -> None:
         """Clean up all servers properly."""
@@ -2952,8 +2741,6 @@ code_theme=self.markdown_theme
                 ("/img","上传图片(仅支持多模态的大模型)"),
                 ("/reload","重新加载配置文件"),
                 ("/stu","显示本轮对话Token使用量"),
-                ("/compact","压缩当前会话并保存到 his_sessions/"),
-                ("/load","加载已保存会话的快捷命令"),
                 ("/help","显示帮助信息"),
                 ("/log","查看日志文件路径"),
                 ("/exit","退出本应用")
@@ -3334,37 +3121,6 @@ code_theme=self.markdown_theme
                     if user_input.lower() == "/exit":
                         server_console.print(" 🖥️ 应用退出中...")
                         break
-                    if user_input.lower() == "/compact":
-                        if self.agent_switch == 0:
-                            error_console.print(" ⚠️ 压缩功能建议在 Agent 模式下使用...")
-                            continue
-                        if len(self.messages)<=3:
-                            error_console.print(" ⚠️ 压缩功能建议对话上下文信息超过3...")
-                            continue
-                        with server_console.status(" 🧠 正在压缩会话..."):
-                            filepath = await self._compact_session()
-                        if filepath:
-                            fname = os.path.basename(filepath)
-                            server_console.print(f" ✅ 会话已压缩保存: [bold]{fname}[/bold]")
-                        continue
-                    if user_input.lower() in ("/load"):
-                        if self.agent_switch == 0:
-                            error_console.print(" ⚠️ 加载 session 建议在 Agent 模式下使用...")
-                            continue
-                        # 第一步：选择文件（普通交互，不能放在 status 内）
-                        picked = await self._pick_session_file()
-                        if not picked:
-                            continue
-                        filepath, filename = picked
-                        # 第二步：读取并注入（快速操作，可包 status）
-                        with server_console.status(f" 📂 加载 {filename} ..."):
-                            result = await self._load_session_file(filepath, filename)
-                        if result:
-                            server_console.print(f" ✅ 已加载会话: [bold]{result}[/bold]")
-                            server_console.print(" 💡 已加载的会话已作为上下文消息插入（system prompt 未修改，缓存不受影响）。")
-                        else:
-                            error_console.print(" ⚠️ 当前会话已经加载过了/加载会话报错..")
-                        continue
                     if user_input.lower() == "/img":
                         if not self.llm_client.support_multimodal:
                             error_console.print(" ⚠️ 此大模型不支持图片...")
