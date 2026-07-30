@@ -1,11 +1,13 @@
 ## 大体介绍
 这个是小型的龙虾客户端，主要兼容openai类型格式的api的模型，部分代码为AI生成。
- - 在`configs.json`中配置了api_key和api_url，及mcp服务的地址。
+ - 在`configs.json`中配置了api_key和api_url，及mcp服务的地址、百度bce平台key、飞书机器人key。
  - mcp服务配置项中有特殊项`when_to_use`，因为本客户端针对MCP也做了“渐进式披露”处理，需要你维护好，便于大模型准确选择使用
  - 输入`/`可以列出各种命令
  - 需要当前目录下建立2个文件夹：`skills`、`workspace` !
  - 在`skills/`文件夹下，可以添加各种技能
- - 在`workspace/`文件夹是各种工作目录，下面可以添加一个`memory.md`, 写入用户的工具调用习惯
+ - 在`tiny_claw_workspace/`文件夹是各种工作目录，下面可以添加一个`AGENT.md`
+ - 在`agent_workspaces/`文件夹是各种工作流运行工作目录
+ - 在`flows`文件夹下放工作流配置文件，可以通过命令执行
 
 ## 安装
 python >= 3.13  
@@ -230,14 +232,5 @@ sequenceDiagram
 4. **多模态支持**：
    - 支持上传图片进行对话
    - 图片转换为base64格式发送给支持多模态的LLM
-
-## 客户端快照
-1、基本命令  
-<img width="761" height="983" alt="image" src="https://github.com/user-attachments/assets/e8df57dd-ff44-4800-bb60-6eed70bb8bb9" />
-
-
-2、工具调用  
-<img width="755" height="670" alt="image" src="https://github.com/user-attachments/assets/92bfaf61-af43-41cd-a760-5049a6b4e4b5" />
-
 
 
