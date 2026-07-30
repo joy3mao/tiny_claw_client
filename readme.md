@@ -13,6 +13,11 @@
 python >= 3.13  
 `pip install -r requirements.txt`
 
+## 运行
+两套UI：
+`python3 tiny_claw_tui.py` -- TUI版本
+`python3 tiny_claw_console.py` -- 控制台版本
+
 
 ## 类图
 
